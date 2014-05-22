@@ -1,0 +1,80 @@
+PURPOSE AND OPERATION:
+
+The module performs the checks if the number of HTTP requests from a single IP 
+exceeds a certain allowed maximum during a chosen period of time. If so, it
+makes the HTTP server respond to the requests from such IP addresses with a
+chosen HTTP response code (e.g, 402). The checks can be performed either 
+globally for the whole web-server, or for certain URLs that match some pattern. 
+
+INSTALLATION:
+This module works with Apache2 verions 2.0.52 and greater and requires the 
+following packages:
+apr_memcache http://svn.northnitch.com/apr_memcache/trunk/
+(uses the locally included code, and will not install it)
+
+m4 'helper' modules http://svn.outoforder.cc/svn/autoconf/trunk/m4
+
+memcached http://code.sixapart.com/svn/memcached/trunk/
+
+
+To build the module, run
+./configure
+make
+Then `su' to root and  
+make install
+Usually, this will do the job. See the output of ./configure --help for more
+configuration options.
+
+The sample configuration to load and set up the module is located in 
+mod_mod_ip_count.conf. 
+
+This code is licenced under ASF License, version 2.0
+
+autoconf magic was stolen/from (and the original author didn't succeed much in 
+that, so many modifications were done and there are many more to do) 
+mod_transform.. a excellent module from svn.outoforder.cc 
+
+USAGE AND CONFIGURATION DIRECTIVES
+Once installed, the module needs to be configured globally (a per-virtual-host
+configuration seems useless now). Here is the list of presently available
+configuration directives and their usage:
+
+MemCacheServers
+A list of memcached servers the module will use. By default, a newly installed
+memcached will bind to localhost:11211, and it is the default setting for the
+module, so you may just skip this setting if you didn't reconfigure memcached
+
+UriList
+List of sample patterns. If the directive is set, only the requests containing
+such pattern inside the URI part will be counted, and the rest will be ignored.
+If the directive is omitted the module will operate on all requests. 
+
+MemCacheMaxTime
+MemCacheMaxRequests
+Set the time in seconds and the number of requests per IP to serve during this
+time. The requests that come after such limit is exceeded are replied with some
+HTTP code instead of being processed normally. Note that a single user opening
+a single webpage generates several requests (as an excelent example, see your
+Apache log after directing your web browser to a simple phpinfo page). 
+Therefore, you might probably have to gather some per-page request statistics
+for your site to figure out the appropriate values.
+
+MemCacheBlockTime
+Optionally, set the time in seconds during which the request from IP's which
+have exceeded their maximum are being blocked.
+
+HttpResponse
+Numeric HTTP return code to be sent in response to the requests after their 
+number excceeds the permitted limit. If omitted, the default 402 return code
+will be used
+
+MemCacheAllow
+IP-adresses and/or `env' variables with which an unlimited number of requests
+is permitted
+
+Latency
+When it's impossible to tell exatly, how many requests will user generate
+with a single hit on a web address, this directive may be used to count
+all the requests coming during the specified period of time (in microseconds,
+0,000001 second) from a single IP as a single request. The option is not
+mandatory

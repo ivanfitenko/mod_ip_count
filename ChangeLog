@@ -1,0 +1,21 @@
+
+2008-11-21 sin 2.2.0-cvs
+        * Configure script now detects whether to use apxs or apxs2
+	* Removed needless check for g++ presence that prevented module from 
+	    building on the systems where g++ is not installed
+
+2008-04-16 sin 2.1.1 bugfix release
+	* Fixed 'Segmentation Fault' when there are no memcache servers. 
+
+2008-03-19 sin 2.1.0 release
+	* Added support for per-url request processing via pattern matching
+	* HTTP server response is now customizable through config file
+	* A blocking time period can be set for IPs from which the number of 
+	    requests exceeds the allowed maximum.
+	* Added whitelisting (oops... MemCacheAllow option in the sample config
+	    until I discovered it being only there but not in the code :D )
+	* Added `Latency` (see README for explanation)
+	* Now the included memcache client interface can be compiled on both
+	    Apache 2.0.x and Apache 2.2.x
+	* Some minor bugfixes and some new bugs, yet unknown. As usual ^)
+	

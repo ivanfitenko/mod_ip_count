@@ -1,0 +1,49 @@
+# $Id: mod_ip_count.conf.sample,v 1.2 2008/11/22 09:10:07 proger Exp $
+
+LoadModule ip_count_module modules/mod_ip_count.so
+
+<IfModule mod_ip_count.c>
+
+    # a list of servers running the memcached server (host:port)
+    # MemCacheServers "localhost:11211 localhost:11210"
+    
+    # operate on uris containing theese patterns
+    # UriList ".js index" 
+
+    # the name of the cookie on what to cache on, falling back to IP# when not present
+    # MemCacheCookieName
+
+    # Fallbackheader if cookie isn't present. It will go to IP# if this isn't there
+    # MemCacheFallbackHeader
+
+    # Max number of requests before failing
+    # MemCacheMaxRequests 3
+
+    # Time period in which the requests have to come (seconds)
+    # MemCacheMaxTime 60
+    
+    # Additional blocking time (seconds)
+    # MemCacheBlockTime 300
+    
+    # An HTTP code to return in response to a blocked request
+    # HttpResponse 402
+
+    # Don't Actually disable clients, just say you did
+    # MemCacheJustTesting
+
+    # minimum number of client sockets to open
+    # MemCacheMinSockets
+
+    # Soft maximum number of client connections to open
+    # MemCacheMaxSoftSockets
+
+    # Soft maximum number of client connections to open
+    # MemCacheMaxHardSockets
+
+    # Time to live (in seconds) for each client connection
+    # MemCacheTTL
+
+    # IP adresses NOT to perform checks on 
+    # MemCacheAllow "127.0.0.1 for=bar"
+
+</IfModule>
