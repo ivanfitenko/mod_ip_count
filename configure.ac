@@ -1,10 +1,10 @@
-AC_INIT(mod_ip_count, 0.1.0)
+AC_INIT([mod_ip_count], [2.2.0])
 OOO_CONFIG_NICE(config.nice)
 AC_PREREQ(2.53)
 dnl AC_CONFIG_SRCDIR([memcache/apr_memcache.c])
 AM_MAINTAINER_MODE
 AC_CANONICAL_TARGET
-AM_INIT_AUTOMAKE(AC_PACKAGE_NAME, AC_PACKAGE_VERSION)
+AM_INIT_AUTOMAKE
 AM_CONFIG_HEADER([mod_ip_count.h:config.in])
 
 # Prevent AC_PROG_LIBTOOL from checking for C++
