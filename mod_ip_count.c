@@ -252,8 +252,11 @@ static int ip_count_check_auth(request_rec *r)
     if (r->main) {
         return DECLINED;
     }
+#ifdef WITH_APACHE24
+    key = r->connection->client_ip;
+#else
     key = r->connection->remote_ip;
-
+#endif
 /*    Use this for debugging
  *    key = r->args;
  */
@@ -310,7 +313,11 @@ static int ip_count_check_auth(request_rec *r)
 	} else {
 	    apr_ipsubnet_create(&this_subnet,this_whitelisted_ip,NULL,r->pool);
 	}
+#ifdef WITH_APACHE24
+	if (apr_ipsubnet_test(this_subnet,r->connection->client_addr)) {
+#else
 	if (apr_ipsubnet_test(this_subnet,r->connection->remote_addr)) {
+#endif
 	    return DECLINED;
 	}
 	this_whitelisted_ip = apr_strtok(NULL, " ",&last);

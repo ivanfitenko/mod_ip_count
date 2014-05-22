@@ -1,6 +1,6 @@
 
-dnl CHECK_APACHE([MINIMUM20-VERSION [, MINIMUM22-VERSION [, 
-dnl            ACTION-IF-FOUND20 [, ACTION-IF-FOUND22 [, ACTION-IF-NOT-FOUND]]])
+dnl CHECK_APACHE([MINIMUM20-VERSION [, MINIMUM22-VERSION [, MINIMUM24-VERSION [, 
+dnl            ACTION-IF-FOUND20 [, ACTION-IF-FOUND22 [, ACTION-IF-FOUND24 [, ACTION-IF-NOT-FOUND]]])
 dnl Test for Apache apxs, APR, and APU
 
 AC_DEFUN(CHECK_APACHE,
@@ -33,6 +33,7 @@ AC_ARG_ENABLE(
     fi
     min_apache20_version=ifelse([$1], ,no,$1)
     min_apache22_version=ifelse([$2], ,no,$2)
+    min_apache24_version=ifelse([$3], ,no,$3)
     no_apxs=""
     if test "$APXS_BIN" = "no"; then
         AC_MSG_ERROR([*** The apxs binary installed by apache could not be found!])
@@ -71,7 +72,7 @@ AC_ARG_ENABLE(
                 APU_INCLUDES=`$APU_CONFIG --includes 2>/dev/null`
                 APU_VERSION=`$APU_CONFIG --version 2>/dev/null`
 
-                AC_MSG_CHECKING(for Apache 2.2 version >= $min_apache22_version)
+                AC_MSG_CHECKING(for Apache 2 version >= $min_apache22_version)
                 TEST_APACHE_VERSION(22,$min_apache22_version,
                     AC_MSG_RESULT(yes)
                     AC_DEFINE(WITH_APACHE22,1,[Define to 1 if we are compiling with Apache 2.2.x])
@@ -80,6 +81,21 @@ AC_ARG_ENABLE(
                     AP_CFLAGS="$AP_CFLAGS $APU_INCLUDES $APR_INCLUDES"
                     AP_CPPFLAGS="$AP_CPPFLAGS $APU_INCLUDES $APR_INCLUDES"
                     AP_DEFS="-DWITH_APACHE22"
+                    ifelse([$4], , , $4),
+                    AC_MSG_RESULT(no)
+                    if test "x$min_apache20_version" = "xno"; then
+                        ifelse([$5], , , $5)
+                    fi
+                )
+                AC_MSG_CHECKING(for Apache 2 version >= $min_apache24_version)
+                TEST_APACHE_VERSION(24,$min_apache24_version,
+                    AC_MSG_RESULT(yes)
+                    AC_DEFINE(WITH_APACHE24,1,[Define to 1 if we are compiling with Apache 2.4.x])
+                    AP_VERSION="2.4"
+                    APXS_EXTENSION=.la
+                    AP_CFLAGS="$AP_CFLAGS $APU_INCLUDES $APR_INCLUDES"
+                    AP_CPPFLAGS="$AP_CPPFLAGS $APU_INCLUDES $APR_INCLUDES"
+                    AP_DEFS="-DWITH_APACHE22 -DWITH_APACHE24"
                     ifelse([$4], , , $4),
                     AC_MSG_RESULT(no)
                     if test "x$min_apache20_version" = "xno"; then
