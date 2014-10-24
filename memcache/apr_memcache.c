@@ -1,10 +1,9 @@
-/* $Id: apr_memcache.c,v 1.2 2008/11/22 09:10:08 proger Exp $ */
-
-/* Copyright 2004 Paul Querna
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+/* Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -16,26 +15,41 @@
  */
 
 #include "apr_memcache.h"
+#include "apr_poll.h"
+#include "apr_version.h"
+#include <assert.h>
 #include <stdlib.h>
-
 
 #define BUFFER_SIZE 512
 struct apr_memcache_conn_t
 {
-    char* buffer;
-    apr_uint32_t blen;
+    char *buffer;
+    apr_size_t blen;
     apr_pool_t *p;
+    apr_pool_t *tp;
     apr_socket_t *sock;
-    apr_bucket_alloc_t* balloc;
-    apr_bucket_brigade* bb;
-    apr_bucket_brigade* tb;
+    apr_bucket_brigade *bb;
+    apr_bucket_brigade *tb;
     apr_memcache_server_t *ms;
-};                                                          
+    apr_pollset_t* pollset;  /* Set-up to poll only for this one connection */
+};
+
+/**
+ * Indicates whewther a lock is held when calling helper functions from either
+ * state.
+ */
+typedef enum {
+  LOCK_NOT_HELD,
+  LOCK_HELD
+} lock_status_t;
 
 /* Strings for Client Commands */
 
 #define MC_EOL "\r\n"
 #define MC_EOL_LEN (sizeof(MC_EOL)-1)
+
+#define MC_WS " "
+#define MC_WS_LEN (sizeof(MC_WS)-1)
 
 #define MC_GET "get "
 #define MC_GET_LEN (sizeof(MC_GET)-1)
@@ -63,6 +77,9 @@ struct apr_memcache_conn_t
 
 #define MC_STATS "stats"
 #define MC_STATS_LEN (sizeof(MC_STATS)-1)
+
+#define MC_QUIT "quit"
+#define MC_QUIT_LEN (sizeof(MC_QUIT)-1)
 
 /* Strings for Server Replies */
 
@@ -93,21 +110,43 @@ struct apr_memcache_conn_t
 #define MS_END "END"
 #define MS_END_LEN (sizeof(MS_END)-1)
 
+/** Server and Query Structure for a multiple get */
+struct cache_server_query_t {
+    apr_memcache_server_t* ms;
+    apr_memcache_conn_t* conn;
+    struct iovec* query_vec;
+    apr_int32_t query_vec_count;
+};
 
-static apr_status_t make_server_dead(apr_memcache_t * mc, apr_memcache_server_t * ms)
+/* Default I/O timeout in microseconds. */
+#define MULT_GET_TIMEOUT 50000
+
+static apr_status_t mark_server_dead(apr_memcache_server_t *ms,
+                                     lock_status_t lock_status)
 {
-    ms->status = APR_MC_SERVER_DEAD; 
+#if APR_HAS_THREADS
+    if (lock_status == LOCK_NOT_HELD) {
+        apr_thread_mutex_lock(ms->lock);
+    }
+#endif
+    ms->status = APR_MC_SERVER_DEAD;
+    ms->btime = apr_time_now();
+#if APR_HAS_THREADS
+    if (lock_status == LOCK_NOT_HELD) {
+        apr_thread_mutex_unlock(ms->lock);
+    }
+#endif
     return APR_SUCCESS;
 }
 
-static apr_status_t make_server_live(apr_memcache_t * mc, apr_memcache_server_t * ms)
+static apr_status_t make_server_live(apr_memcache_t *mc, apr_memcache_server_t *ms)
 {
     ms->status = APR_MC_SERVER_LIVE;
     return APR_SUCCESS;
 }
 
 
-APR_DECLARE(apr_status_t) apr_memcache_add_server(apr_memcache_t *mc, apr_memcache_server_t *ms)
+APU_DECLARE(apr_status_t) apr_memcache_add_server(apr_memcache_t *mc, apr_memcache_server_t *ms)
 {
     apr_status_t rv = APR_SUCCESS;
 
@@ -117,36 +156,76 @@ APR_DECLARE(apr_status_t) apr_memcache_add_server(apr_memcache_t *mc, apr_memcac
 
     mc->live_servers[mc->ntotal] = ms;
     mc->ntotal++;
+    ms->memcache = mc;
     make_server_live(mc, ms);
     return rv;
 }
 
-APR_DECLARE(apr_memcache_server_t *) 
+static apr_status_t mc_version_ping_lock_held(apr_memcache_server_t *ms);
+
+APU_DECLARE(apr_memcache_server_t *)
 apr_memcache_find_server_hash(apr_memcache_t *mc, const apr_uint32_t hash)
 {
+    if (mc->server_func) {
+        return mc->server_func(mc->server_baton, mc, hash);
+    }
+    else {
+        return apr_memcache_find_server_hash_default(NULL, mc, hash);
+    }
+}
+
+APU_DECLARE(apr_memcache_server_t *)
+apr_memcache_find_server_hash_default(void *baton, apr_memcache_t *mc,
+                                      const apr_uint32_t hash)
+{
     apr_memcache_server_t *ms = NULL;
-    apr_uint32_t h = hash;
+    apr_uint32_t h = hash ? hash : 1;
     apr_uint32_t i = 0;
-    
+    apr_time_t curtime = 0;
+
     if(mc->ntotal == 0) {
         return NULL;
     }
 
     do {
-        ms = mc->live_servers[hash % mc->ntotal];
-        if(ms->status == APR_MC_SERVER_LIVE)
+        ms = mc->live_servers[h % mc->ntotal];
+        if(ms->status == APR_MC_SERVER_LIVE) {
             break;
+        }
+        else {
+            if (curtime == 0) {
+                curtime = apr_time_now();
+            }
+#if APR_HAS_THREADS
+            apr_thread_mutex_lock(ms->lock);
+#endif
+            /* Try the the dead server, every 5 seconds, keeping the lock. */
+            if (curtime - ms->btime >  apr_time_from_sec(5)) {
+                if (mc_version_ping_lock_held(ms) == APR_SUCCESS) {
+                    ms->btime = curtime;
+                    make_server_live(mc, ms);
+#if APR_HAS_THREADS
+                    apr_thread_mutex_unlock(ms->lock);
+#endif
+                    break;
+                }
+            }
+#if APR_HAS_THREADS
+            apr_thread_mutex_unlock(ms->lock);
+#endif
+        }
         h++;
         i++;
     } while(i < mc->ntotal);
 
-    if(i == mc->ntotal)
+    if (i == mc->ntotal) {
         ms = NULL;
+    }
 
     return ms;
 }
 
-APR_DECLARE(apr_memcache_server_t *) apr_memcache_find_server(apr_memcache_t *mc, const char* host, apr_port_t port)
+APU_DECLARE(apr_memcache_server_t *) apr_memcache_find_server(apr_memcache_t *mc, const char *host, apr_port_t port)
 {
     int i;
 
@@ -161,32 +240,45 @@ APR_DECLARE(apr_memcache_server_t *) apr_memcache_find_server(apr_memcache_t *mc
     return NULL;
 }
 
-static apr_status_t ms_find_conn(apr_memcache_server_t * ms, apr_memcache_conn_t** conn) 
+static apr_status_t ms_find_conn(apr_memcache_server_t *ms, apr_memcache_conn_t **conn)
 {
+    apr_status_t rv;
+    apr_bucket_alloc_t *balloc;
+    apr_bucket *e;
+
 #if APR_HAS_THREADS
-    return apr_reslist_acquire(ms->conns, (void **)conn);
+    rv = apr_reslist_acquire(ms->conns, (void **)conn);
 #else
     *conn = ms->conn;
-    return APR_SUCCESS;
+    rv = APR_SUCCESS;
 #endif
+
+    if (rv != APR_SUCCESS) {
+        return rv;
+    }
+
+    balloc = apr_bucket_alloc_create((*conn)->tp);
+    (*conn)->bb = apr_brigade_create((*conn)->tp, balloc);
+    (*conn)->tb = apr_brigade_create((*conn)->tp, balloc);
+
+    e = apr_bucket_socket_create((*conn)->sock, balloc);
+    APR_BRIGADE_INSERT_TAIL((*conn)->bb, e);
+
+    return rv;
 }
 
-static apr_status_t ms_bad_conn(apr_memcache_server_t * ms, apr_memcache_conn_t* conn) 
+static apr_status_t ms_bad_conn(apr_memcache_server_t *ms, apr_memcache_conn_t *conn)
 {
-#if WITH_APACHE22
-    #if APR_HAS_THREADS
-	return apr_reslist_invalidate(ms->conns, conn);
-    #else
-	return APR_SUCCESS;
-    #endif
+#if APR_HAS_THREADS
+    return apr_reslist_invalidate(ms->conns, conn);
 #else
     return APR_SUCCESS;
 #endif
-
 }
 
-static apr_status_t ms_release_conn(apr_memcache_server_t * ms, apr_memcache_conn_t* conn) 
+static apr_status_t ms_release_conn(apr_memcache_server_t *ms, apr_memcache_conn_t *conn)
 {
+    apr_pool_clear(conn->tp);
 #if APR_HAS_THREADS
     return apr_reslist_release(ms->conns, conn);
 #else
@@ -194,7 +286,7 @@ static apr_status_t ms_release_conn(apr_memcache_server_t * ms, apr_memcache_con
 #endif
 }
 
-APR_DECLARE(apr_status_t) apr_memcache_enable_server(apr_memcache_t * mc, apr_memcache_server_t * ms)
+APU_DECLARE(apr_status_t) apr_memcache_enable_server(apr_memcache_t *mc, apr_memcache_server_t *ms)
 {
     apr_status_t rv = APR_SUCCESS;
 
@@ -206,12 +298,56 @@ APR_DECLARE(apr_status_t) apr_memcache_enable_server(apr_memcache_t * mc, apr_me
     return rv;
 }
 
-APR_DECLARE(apr_status_t) apr_memcache_disable_server(apr_memcache_t * mc, apr_memcache_server_t * ms)
+APU_DECLARE(apr_status_t) apr_memcache_disable_server(apr_memcache_t *mc, apr_memcache_server_t *ms)
 {
-    return make_server_dead(mc, ms);
+    assert(mc == ms->memcache);
+    return mark_server_dead(ms, LOCK_NOT_HELD);
 }
 
-static apr_status_t conn_connect(apr_memcache_conn_t* conn)
+/*
+ * Cleans up connections and/or bad servers as required.
+ *
+ * This function should only be called if rv is not APR_SUCCESS.
+ */
+static void disable_server_and_connection(apr_memcache_server_t *ms,
+                                          lock_status_t lock_status,
+                                          apr_memcache_conn_t *conn) {
+    if (conn != NULL) {
+        ms_bad_conn(ms, conn);
+    }
+    mark_server_dead(ms, lock_status);
+}
+
+/*
+ * Polls a socket to see whether the next I/O operation call will block.
+ * The status returned is based on apr_pollset_poll:
+ * http://apr.apache.org/docs/apr/trunk/group__apr__poll.html#ga6b31d7b3a7b2d356370403dd2b79ecf3
+ *
+ * In practice this appears to return APR_TIMEUP on timeout (hardcoded to 50ms).
+ *
+ * Returns APR_SUCCESSS if it's OK to read.  Otherwise it releases the
+ * connection and returns the status.
+ */
+static apr_status_t poll_server_releasing_connection_on_failure(
+    apr_memcache_server_t *ms,
+    lock_status_t lock_status,
+    apr_memcache_conn_t *conn) {
+    apr_int32_t queries_recvd;
+    const apr_pollfd_t* activefds;
+    apr_status_t rv = apr_pollset_poll(conn->pollset,
+                                       ms->memcache->timeout_microseconds,
+                                       &queries_recvd, &activefds);
+    if (rv == APR_SUCCESS) {
+        assert(queries_recvd == 1);
+        assert(activefds->desc.s == conn->sock);
+        assert(activefds->client_data == NULL);
+    } else {
+        disable_server_and_connection(ms, lock_status, conn);
+    }
+    return rv;
+}
+
+static apr_status_t conn_connect(apr_memcache_conn_t *conn)
 {
     apr_status_t rv = APR_SUCCESS;
     apr_sockaddr_t *sa;
@@ -221,12 +357,17 @@ static apr_status_t conn_connect(apr_memcache_conn_t* conn)
         return rv;
     }
 
+    rv = apr_socket_timeout_set(conn->sock, 1 * APR_USEC_PER_SEC);
+    if (rv != APR_SUCCESS) {
+        return rv;
+    }
+
     rv = apr_socket_connect(conn->sock, sa);
     if (rv != APR_SUCCESS) {
         return rv;
     }
 
-    rv = apr_socket_timeout_set(conn->sock, 1 * APR_USEC_PER_SEC);
+    rv = apr_socket_timeout_set(conn->sock, -1);
     if (rv != APR_SUCCESS) {
         return rv;
     }
@@ -234,68 +375,132 @@ static apr_status_t conn_connect(apr_memcache_conn_t* conn)
     return rv;
 }
 
+static apr_status_t conn_clean(void *data)
+{
+    apr_memcache_conn_t *conn = data;
+    struct iovec vec[2];
+    apr_size_t written;
+
+    /* send a quit message to the memcached server to be nice about it. */
+    vec[0].iov_base = (char*) MC_QUIT;
+    vec[0].iov_len = MC_QUIT_LEN;
+
+    vec[1].iov_base = (char*) MC_EOL;
+    vec[1].iov_len = MC_EOL_LEN;
+
+    /* Return values not checked, since we just want to make it go away. */
+    apr_socket_sendv(conn->sock, vec, 2, &written);
+    apr_socket_close(conn->sock);
+
+    conn->p = NULL; /* so that destructor does not destroy the pool again */
+
+    return APR_SUCCESS;
+}
 
 static apr_status_t
 mc_conn_construct(void **conn_, void *params, apr_pool_t *pool)
 {
     apr_status_t rv = APR_SUCCESS;
     apr_memcache_conn_t *conn;
-    apr_bucket* e;
-    apr_pool_t* np;
+    apr_pool_t *np;
+    apr_pool_t *tp;
     apr_memcache_server_t *ms = params;
+    apr_pollset_t* pollset = NULL;
 
     rv = apr_pool_create(&np, pool);
     if (rv != APR_SUCCESS) {
         return rv;
     }
 
-    conn = apr_palloc(np, sizeof( apr_memcache_conn_t ));
-
-    conn->p = np;
-#if WITH_APACHE22
-    rv = apr_socket_create(&conn->sock, APR_INET, SOCK_STREAM, 0, np);
-#else
-    rv = apr_socket_create(&conn->sock, APR_INET, SOCK_STREAM, np);
-#endif
+    /* Pre-allocate a pollset at a point where it's easy to bail on failure. */
+    rv = apr_pollset_create(&pollset, 1, np, 0);
     if (rv != APR_SUCCESS) {
+        apr_pool_destroy(np);
         return rv;
     }
 
-    conn->balloc = apr_bucket_alloc_create(conn->p);
-    conn->bb = apr_brigade_create(conn->p, conn->balloc);
-    conn->tb = apr_brigade_create(conn->p, conn->balloc);
+    rv = apr_pool_create(&tp, np);
+    if (rv != APR_SUCCESS) {
+        apr_pool_destroy(np);
+        return rv;
+    }
+
+#if APR_HAS_THREADS
+    conn = malloc(sizeof( apr_memcache_conn_t )); /* non-pool space! */
+#else
+    conn = apr_palloc(np, sizeof( apr_memcache_conn_t ));
+#endif
+
+    conn->p = np;
+    conn->tp = tp;
+
+    rv = apr_socket_create(&conn->sock, APR_INET, SOCK_STREAM, 0, np);
+
+    if (rv != APR_SUCCESS) {
+        apr_pool_destroy(np);
+#if APR_HAS_THREADS
+        free(conn);
+#endif
+        return rv;
+    }
+
     conn->buffer = apr_palloc(conn->p, BUFFER_SIZE);
     conn->blen = 0;
     conn->ms = ms;
 
-    e = apr_bucket_socket_create(conn->sock, conn->balloc);
-    APR_BRIGADE_INSERT_TAIL(conn->bb, e);
-
     rv = conn_connect(conn);
-    *conn_ = conn;
+    if (rv != APR_SUCCESS) {
+        apr_pool_destroy(np);
+#if APR_HAS_THREADS
+        free(conn);
+#endif
+    }
+    else {
+        apr_pool_cleanup_register(np, conn, conn_clean, apr_pool_cleanup_null);
+        *conn_ = conn;
+
+        /*
+         * Populate an 'is readable' pollset for this socket to allow early
+         * timeout detection.
+         */
+        conn->pollset = pollset;
+        apr_pollfd_t pollfd;
+        pollfd.desc_type = APR_POLL_SOCKET;
+        pollfd.reqevents = APR_POLLIN;
+        pollfd.p = np;
+        pollfd.desc.s = conn->sock;
+        pollfd.client_data = NULL;
+        apr_pollset_add(conn->pollset, &pollfd);
+    }
 
     return rv;
 }
 
+#if APR_HAS_THREADS
 static apr_status_t
-mc_conn_destruct(void *conn_, void *params, apr_pool_t * pool)
+mc_conn_destruct(void *conn_, void *params, apr_pool_t *pool)
 {
-    apr_memcache_conn_t *conn = conn_;
+    apr_memcache_conn_t *conn = (apr_memcache_conn_t*)conn_;
 
-/*    apr_pool_destroy(conn->p); */
+    if (conn->p) {
+        apr_pool_destroy(conn->p);
+    }
+
+    free(conn); /* free non-pool space */
 
     return APR_SUCCESS;
 }
+#endif
 
-APR_DECLARE(apr_status_t) apr_memcache_server_create(apr_pool_t* p, 
-                                                     const char* host, apr_port_t port, 
+APU_DECLARE(apr_status_t) apr_memcache_server_create(apr_pool_t *p,
+                                                     const char *host, apr_port_t port,
                                                      apr_uint32_t min, apr_uint32_t smax,
                                                      apr_uint32_t max, apr_uint32_t ttl,
-                                                     apr_memcache_server_t** ms)
+                                                     apr_memcache_server_t **ms)
 {
     apr_status_t rv = APR_SUCCESS;
     apr_memcache_server_t *server;
-    apr_pool_t* np;
+    apr_pool_t *np;
 
     rv = apr_pool_create(&np, p);
 
@@ -305,8 +510,14 @@ APR_DECLARE(apr_status_t) apr_memcache_server_create(apr_pool_t* p,
     server->host = apr_pstrdup(np, host);
     server->port = port;
     server->status = APR_MC_SERVER_DEAD;
+    server->memcache = NULL;
 #if APR_HAS_THREADS
-    rv = apr_reslist_create(&server->conns, 
+    rv = apr_thread_mutex_create(&server->lock, APR_THREAD_MUTEX_DEFAULT, np);
+    if (rv != APR_SUCCESS) {
+        return rv;
+    }
+
+    rv = apr_reslist_create(&server->conns,
                                min,                     /* hard minimum */
                                smax,                    /* soft maximum */
                                max,                     /* hard maximum */
@@ -327,28 +538,33 @@ APR_DECLARE(apr_status_t) apr_memcache_server_create(apr_pool_t* p,
     return rv;
 }
 
-APR_DECLARE(apr_status_t) apr_memcache_create(apr_pool_t *p,
+APU_DECLARE(apr_status_t) apr_memcache_create(apr_pool_t *p,
                                               apr_uint16_t max_servers, apr_uint32_t flags,
-                                              apr_memcache_t **memcache) 
+                                              apr_memcache_t **memcache)
 {
     apr_status_t rv = APR_SUCCESS;
     apr_memcache_t *mc;
-    
+
     mc = apr_palloc(p, sizeof(apr_memcache_t));
     mc->p = p;
     mc->nalloc = max_servers;
     mc->ntotal = 0;
     mc->live_servers = apr_palloc(p, mc->nalloc * sizeof(struct apr_memcache_server_t *));
+    mc->hash_func = NULL;
+    mc->hash_baton = NULL;
+    mc->server_func = NULL;
+    mc->server_baton = NULL;
+    mc->timeout_microseconds = MULT_GET_TIMEOUT;
     *memcache = mc;
     return rv;
 }
 
 
 /* The crc32 functions and data was originally written by Spencer
- * Garrett <srg@quick.com> and was cleaned from the PostgreSQL source
- * tree via the files contrib/ltree/crc32.[ch].  No license was
- * included, therefore it is assumed that this code is public
- * domain. */
+ * Garrett <srg@quick.com> and was gleaned from the PostgreSQL source
+ * tree via the files contrib/ltree/crc32.[ch] and from FreeBSD at
+ * src/usr.bin/cksum/crc32.c.
+ */
 
 static const apr_uint32_t crc32tab[256] = {
   0x00000000, 0x77073096, 0xee0e612c, 0x990951ba,
@@ -417,7 +633,9 @@ static const apr_uint32_t crc32tab[256] = {
   0xb40bbe37, 0xc30c8ea1, 0x5a05df1b, 0x2d02ef8d,
 };
 
-APR_DECLARE(apr_uint32_t) apr_memcache_hash(const char* data, const apr_uint32_t data_len)
+APU_DECLARE(apr_uint32_t) apr_memcache_hash_crc32(void *baton,
+                                                  const char *data,
+                                                  const apr_size_t data_len)
 {
     apr_uint32_t i;
     apr_uint32_t crc;
@@ -425,58 +643,101 @@ APR_DECLARE(apr_uint32_t) apr_memcache_hash(const char* data, const apr_uint32_t
 
     for (i = 0; i < data_len; i++)
         crc = (crc >> 8) ^ crc32tab[(crc ^ (data[i])) & 0xff];
-  
-    return ((~crc >> 16) & 0x7fff);
+
+    return ~crc;
 }
 
-static apr_status_t get_server_line(apr_memcache_conn_t* conn)
+APU_DECLARE(apr_uint32_t) apr_memcache_hash_default(void *baton,
+                                                    const char *data,
+                                                    const apr_size_t data_len)
 {
-    int bsize = BUFFER_SIZE;
+    /* The default Perl Client doesn't actually use just crc32 -- it shifts it again
+     * like this....
+     */
+    return ((apr_memcache_hash_crc32(baton, data, data_len) >> 16) & 0x7fff);
+}
+
+APU_DECLARE(apr_uint32_t) apr_memcache_hash(apr_memcache_t *mc,
+                                            const char *data,
+                                            const apr_size_t data_len)
+{
+    if (mc->hash_func) {
+        return mc->hash_func(mc->hash_baton, data, data_len);
+    }
+    else {
+        return apr_memcache_hash_default(NULL, data, data_len);
+    }
+}
+
+static apr_status_t get_server_line(apr_memcache_conn_t *conn)
+{
+    apr_size_t bsize = BUFFER_SIZE;
     apr_status_t rv = APR_SUCCESS;
 
     rv = apr_brigade_split_line(conn->tb, conn->bb, APR_BLOCK_READ, BUFFER_SIZE);
 
-    if(rv != APR_SUCCESS) {
+    if (rv != APR_SUCCESS) {
         return rv;
     }
 
     rv = apr_brigade_flatten(conn->tb, conn->buffer, &bsize);
 
-    if(rv != APR_SUCCESS) {
+    if (rv != APR_SUCCESS) {
         return rv;
     }
 
     conn->blen = bsize;
     conn->buffer[bsize] = '\0';
 
-    apr_brigade_cleanup(conn->tb);
+    return apr_brigade_cleanup(conn->tb);
+}
 
-    if(rv != APR_SUCCESS) {
+static apr_status_t sendv_and_get_server_line_with_timeout(
+    apr_memcache_server_t *ms,
+    apr_memcache_conn_t *conn,
+    struct iovec* vec,
+    int vec_size,
+    lock_status_t lock_status) {
+
+    apr_size_t written;
+    apr_status_t rv = apr_socket_sendv(conn->sock, vec, vec_size, &written);
+    if (rv != APR_SUCCESS) {
+        disable_server_and_connection(ms, lock_status, conn);
         return rv;
     }
+
+    rv = poll_server_releasing_connection_on_failure(ms, lock_status, conn);
+    if (rv != APR_SUCCESS) {
+        return rv;
+    }
+
+    rv = get_server_line(conn);
+    if (rv != APR_SUCCESS) {
+        disable_server_and_connection(ms, LOCK_NOT_HELD, conn);
+    }
+
     return rv;
 }
 
 static apr_status_t storage_cmd_write(apr_memcache_t *mc,
-                                      char* cmd,
-                                      const apr_uint32_t cmd_size,
-                                      const char* key,
+                                      const char *cmd,
+                                      const apr_size_t cmd_size,
+                                      const char *key,
                                       char *data,
-                                      const apr_uint32_t data_size,
+                                      const apr_size_t data_size,
                                       apr_uint32_t timeout,
-                                      apr_uint32_t flags)
+                                      apr_uint16_t flags)
 {
     apr_uint32_t hash;
-    apr_memcache_server_t* ms;
-    apr_memcache_conn_t* conn;
+    apr_memcache_server_t *ms;
+    apr_memcache_conn_t *conn;
     apr_status_t rv;
-    apr_size_t written;
     struct iovec vec[5];
-    int klen;
+    apr_size_t klen;
 
-    int key_size = strlen(key);
+    apr_size_t key_size = strlen(key);
 
-    hash = apr_memcache_hash(key, key_size);
+    hash = apr_memcache_hash(mc, key, key_size);
 
     ms = apr_memcache_find_server_hash(mc, hash);
 
@@ -492,13 +753,14 @@ static apr_status_t storage_cmd_write(apr_memcache_t *mc,
 
     /* <command name> <key> <flags> <exptime> <bytes>\r\n<data>\r\n */
 
-    vec[0].iov_base = cmd;
+    vec[0].iov_base = (char*) cmd;
     vec[0].iov_len  = cmd_size;
 
     vec[1].iov_base = (void*)key;
     vec[1].iov_len  = key_size;
 
-    klen = snprintf(conn->buffer, BUFFER_SIZE, " %u %u %u" MC_EOL, flags, timeout, data_size);
+    klen = apr_snprintf(conn->buffer, BUFFER_SIZE, " %u %u %" APR_SIZE_T_FMT " " MC_EOL,
+                        flags, timeout, data_size);
 
     vec[2].iov_base = conn->buffer;
     vec[2].iov_len  = klen;
@@ -506,22 +768,12 @@ static apr_status_t storage_cmd_write(apr_memcache_t *mc,
     vec[3].iov_base = data;
     vec[3].iov_len  = data_size;
 
-    vec[4].iov_base = MC_EOL;
+    vec[4].iov_base = (char*) MC_EOL;
     vec[4].iov_len  = MC_EOL_LEN;
 
-    rv = apr_socket_sendv(conn->sock, vec, 5, &written);
-
+    rv = sendv_and_get_server_line_with_timeout(ms, conn, vec, 5,
+                                                LOCK_NOT_HELD);
     if (rv != APR_SUCCESS) {
-        ms_bad_conn(ms, conn);
-        apr_memcache_disable_server(mc, ms);
-        return rv;
-    }
-
-    rv = get_server_line(conn);
-
-    if (rv != APR_SUCCESS) {
-        ms_bad_conn(ms, conn);
-        apr_memcache_disable_server(mc, ms);
         return rv;
     }
 
@@ -540,13 +792,13 @@ static apr_status_t storage_cmd_write(apr_memcache_t *mc,
     return rv;
 }
 
-APR_DECLARE(apr_status_t)
+APU_DECLARE(apr_status_t)
 apr_memcache_set(apr_memcache_t *mc,
-                 const char* key,
+                 const char *key,
                  char *data,
-                 const apr_uint32_t data_size,
+                 const apr_size_t data_size,
                  apr_uint32_t timeout,
-                 apr_uint32_t flags)
+                 apr_uint16_t flags)
 {
     return storage_cmd_write(mc,
                            MC_SET, MC_SET_LEN,
@@ -555,28 +807,28 @@ apr_memcache_set(apr_memcache_t *mc,
                            timeout, flags);
 }
 
-APR_DECLARE(apr_status_t)
+APU_DECLARE(apr_status_t)
 apr_memcache_add(apr_memcache_t *mc,
-                 const char* key,
+                 const char *key,
                  char *data,
-                 const apr_uint32_t data_size,
+                 const apr_size_t data_size,
                  apr_uint32_t timeout,
-                 apr_uint32_t flags)
+                 apr_uint16_t flags)
 {
-    return storage_cmd_write(mc, 
+    return storage_cmd_write(mc,
                            MC_ADD, MC_ADD_LEN,
                            key,
                            data, data_size,
                            timeout, flags);
 }
 
-APR_DECLARE(apr_status_t)
+APU_DECLARE(apr_status_t)
 apr_memcache_replace(apr_memcache_t *mc,
-                 const char* key,
+                 const char *key,
                  char *data,
-                 const apr_uint32_t data_size,
+                 const apr_size_t data_size,
                  apr_uint32_t timeout,
-                 apr_uint32_t flags)
+                 apr_uint16_t flags)
 {
     return storage_cmd_write(mc,
                            MC_REPLACE, MC_REPLACE_LEN,
@@ -586,27 +838,42 @@ apr_memcache_replace(apr_memcache_t *mc,
 
 }
 
-APR_DECLARE(apr_status_t)
+/*
+ * Parses a decimal size from size_str, returning the value in *size.
+ * Returns 1 if parsing was successful, 0 if parsing failed.
+ */
+static int parse_size(const char *size_str, apr_size_t *size) {
+    char *endptr = NULL;
+    long size_as_long = strtol(size_str, &endptr, 10);
+    if ((endptr == NULL) || (endptr == size_str) || (size_as_long < 0) ||
+        ((*endptr != '\0') && (*endptr != '\r') && (*endptr != ' ') &&
+         (*endptr != '\n'))) {
+        return 0;
+    }
+    *size = size_as_long;
+    return 1;
+}
+
+APU_DECLARE(apr_status_t)
 apr_memcache_getp(apr_memcache_t *mc,
                   apr_pool_t *p,
-                  const char* key,
+                  const char *key,
                   char **baton,
                   apr_size_t *new_length,
-                  apr_uint32_t *flags_)
+                  apr_uint16_t *flags_)
 {
     apr_status_t rv;
-    apr_memcache_server_t* ms;
-    apr_memcache_conn_t* conn;
+    apr_memcache_server_t *ms;
+    apr_memcache_conn_t *conn;
     apr_uint32_t hash;
-    apr_size_t written;
-    int klen = strlen(key);
+    apr_size_t klen = strlen(key);
     struct iovec vec[3];
 
-    hash = apr_memcache_hash(key, klen);
+    hash = apr_memcache_hash(mc, key, klen);
     ms = apr_memcache_find_server_hash(mc, hash);
     if (ms == NULL)
         return APR_NOTFOUND;
-    
+
     rv = ms_find_conn(ms, &conn);
 
     if (rv != APR_SUCCESS) {
@@ -615,48 +882,37 @@ apr_memcache_getp(apr_memcache_t *mc,
     }
 
     /* get <key>[ <key>[...]]\r\n */
-    vec[0].iov_base = MC_GET;
+    vec[0].iov_base = (char*) MC_GET;
     vec[0].iov_len  = MC_GET_LEN;
 
     vec[1].iov_base = (void*)key;
     vec[1].iov_len  = klen;
 
-    vec[2].iov_base = MC_EOL;
+    vec[2].iov_base = (char*) MC_EOL;
     vec[2].iov_len  = MC_EOL_LEN;
 
-    rv = apr_socket_sendv(conn->sock, vec, 3, &written);
-
+    rv = sendv_and_get_server_line_with_timeout(ms, conn, vec, 3,
+                                                LOCK_NOT_HELD);
     if (rv != APR_SUCCESS) {
-        ms_bad_conn(ms, conn);
-        apr_memcache_disable_server(mc, ms);
-        return rv;
-    }
-
-    rv = get_server_line(conn);
-    if (rv != APR_SUCCESS) {
-        ms_bad_conn(ms, conn);
-        apr_memcache_disable_server(mc, ms);
         return rv;
     }
 
     if (strncmp(MS_VALUE, conn->buffer, MS_VALUE_LEN) == 0) {
         char *flags;
         char *length;
-        char *start;
         char *last;
-        apr_uint32_t len;
+        apr_size_t len = 0;
 
-        start = conn->buffer;
-        flags = apr_strtok(conn->buffer," ",&last);
-        flags = apr_strtok(NULL," ",&last);
-        flags = apr_strtok(NULL," ",&last);
+        flags = apr_strtok(conn->buffer, " ", &last);
+        flags = apr_strtok(NULL, " ", &last);
+        flags = apr_strtok(NULL, " ", &last);
 
-        if (flags_)
+        if (flags_) {
             *flags_ = atoi(flags);
+        }
 
-        length = apr_strtok(NULL," ",&last);
-        len = atoi(length);
-        if (len <= 0)  {
+        length = apr_strtok(NULL, " ", &last);
+        if (length && !parse_size(length, &len)) {
             *new_length = 0;
             *baton = NULL;
         }
@@ -672,7 +928,7 @@ apr_memcache_getp(apr_memcache_t *mc,
                 apr_memcache_disable_server(mc, ms);
                 return rv;
             }
-            
+
             bbb = apr_brigade_split(conn->bb, e);
 
             rv = apr_brigade_pflatten(conn->bb, baton, &len, p);
@@ -695,7 +951,7 @@ apr_memcache_getp(apr_memcache_t *mc,
             *new_length = len - 2;
             (*baton)[*new_length] = '\0';
         }
-        
+
         rv = get_server_line(conn);
         if (rv != APR_SUCCESS) {
             ms_bad_conn(ms, conn);
@@ -719,24 +975,23 @@ apr_memcache_getp(apr_memcache_t *mc,
     return rv;
 }
 
-APR_DECLARE(apr_status_t)
+APU_DECLARE(apr_status_t)
 apr_memcache_delete(apr_memcache_t *mc,
-                    const char* key,
+                    const char *key,
                     apr_uint32_t timeout)
 {
     apr_status_t rv;
-    apr_memcache_server_t* ms;
-    apr_memcache_conn_t* conn;
+    apr_memcache_server_t *ms;
+    apr_memcache_conn_t *conn;
     apr_uint32_t hash;
-    apr_size_t written;
     struct iovec vec[3];
-    int klen = strlen(key);
+    apr_size_t klen = strlen(key);
 
-    hash = apr_memcache_hash(key, klen);
+    hash = apr_memcache_hash(mc, key, klen);
     ms = apr_memcache_find_server_hash(mc, hash);
     if (ms == NULL)
         return APR_NOTFOUND;
-    
+
     rv = ms_find_conn(ms, &conn);
 
     if (rv != APR_SUCCESS) {
@@ -745,29 +1000,20 @@ apr_memcache_delete(apr_memcache_t *mc,
     }
 
     /* delete <key> <time>\r\n */
-    vec[0].iov_base = MC_DELETE;
+    vec[0].iov_base = (char*) MC_DELETE;
     vec[0].iov_len  = MC_DELETE_LEN;
 
     vec[1].iov_base = (void*)key;
     vec[1].iov_len  = klen;
 
-    klen = snprintf(conn->buffer, BUFFER_SIZE, " %u" MC_EOL, timeout);
+    klen = apr_snprintf(conn->buffer, BUFFER_SIZE, " %u" MC_EOL, timeout);
 
     vec[2].iov_base = conn->buffer;
     vec[2].iov_len  = klen;
 
-    rv = apr_socket_sendv(conn->sock, vec, 3, &written);
-
+    rv = sendv_and_get_server_line_with_timeout(ms, conn, vec, 3,
+                                                LOCK_NOT_HELD);
     if (rv != APR_SUCCESS) {
-        ms_bad_conn(ms, conn);
-        apr_memcache_disable_server(mc, ms);
-        return rv;
-    }
-
-    rv = get_server_line(conn);
-    if (rv != APR_SUCCESS) {
-        ms_bad_conn(ms, conn);
-        apr_memcache_disable_server(mc, ms);
         return rv;
     }
 
@@ -787,25 +1033,24 @@ apr_memcache_delete(apr_memcache_t *mc,
 }
 
 static apr_status_t num_cmd_write(apr_memcache_t *mc,
-                                      char* cmd,
-                                      const apr_uint32_t cmd_size,
-                                      const char* key,
-                                      const apr_int32_t inc,
-                                      apr_uint32_t *new_value)
+                                  const char *cmd,
+                                  const apr_uint32_t cmd_size,
+                                  const char *key,
+                                  const apr_int32_t inc,
+                                  apr_uint32_t *new_value)
 {
     apr_status_t rv;
-    apr_memcache_server_t* ms;
-    apr_memcache_conn_t* conn;
+    apr_memcache_server_t *ms;
+    apr_memcache_conn_t *conn;
     apr_uint32_t hash;
-    apr_size_t written;
     struct iovec vec[3];
-    int klen = strlen(key);
+    apr_size_t klen = strlen(key);
 
-    hash = apr_memcache_hash(key, klen);
+    hash = apr_memcache_hash(mc, key, klen);
     ms = apr_memcache_find_server_hash(mc, hash);
     if (ms == NULL)
         return APR_NOTFOUND;
-    
+
     rv = ms_find_conn(ms, &conn);
 
     if (rv != APR_SUCCESS) {
@@ -814,29 +1059,20 @@ static apr_status_t num_cmd_write(apr_memcache_t *mc,
     }
 
     /* <cmd> <key> <value>\r\n */
-    vec[0].iov_base = cmd;
+    vec[0].iov_base = (char*) cmd;
     vec[0].iov_len  = cmd_size;
 
     vec[1].iov_base = (void*)key;
     vec[1].iov_len  = klen;
 
-    klen = snprintf(conn->buffer, BUFFER_SIZE, " %u" MC_EOL, inc);
+    klen = apr_snprintf(conn->buffer, BUFFER_SIZE, " %u" MC_EOL, inc);
 
     vec[2].iov_base = conn->buffer;
     vec[2].iov_len  = klen;
 
-    rv = apr_socket_sendv(conn->sock, vec, 3, &written);
-
+    rv = sendv_and_get_server_line_with_timeout(ms, conn, vec, 3,
+                                                LOCK_NOT_HELD);
     if (rv != APR_SUCCESS) {
-        ms_bad_conn(ms, conn);
-        apr_memcache_disable_server(mc, ms);
-        return rv;
-    }
-
-    rv = get_server_line(conn);
-    if (rv != APR_SUCCESS) {
-        ms_bad_conn(ms, conn);
-        apr_memcache_disable_server(mc, ms);
         return rv;
     }
 
@@ -847,8 +1083,9 @@ static apr_status_t num_cmd_write(apr_memcache_t *mc,
         rv = APR_NOTFOUND;
     }
     else {
-        if(new_value)
+        if (new_value) {
             *new_value = atoi(conn->buffer);
+        }
         rv = APR_SUCCESS;
     }
 
@@ -857,9 +1094,9 @@ static apr_status_t num_cmd_write(apr_memcache_t *mc,
     return rv;
 }
 
-APR_DECLARE(apr_status_t)
+APU_DECLARE(apr_status_t)
 apr_memcache_incr(apr_memcache_t *mc,
-                    const char* key,
+                    const char *key,
                     apr_int32_t inc,
                     apr_uint32_t *new_value)
 {
@@ -867,14 +1104,14 @@ apr_memcache_incr(apr_memcache_t *mc,
                          MC_INCR,
                          MC_INCR_LEN,
                          key,
-                         inc, 
+                         inc,
                          new_value);
 }
 
 
-APR_DECLARE(apr_status_t)
+APU_DECLARE(apr_status_t)
 apr_memcache_decr(apr_memcache_t *mc,
-                    const char* key,
+                    const char *key,
                     apr_int32_t inc,
                     apr_uint32_t *new_value)
 {
@@ -882,20 +1119,19 @@ apr_memcache_decr(apr_memcache_t *mc,
                          MC_DECR,
                          MC_DECR_LEN,
                          key,
-                         inc, 
+                         inc,
                          new_value);
 }
 
 
 
-APR_DECLARE(apr_status_t)
+APU_DECLARE(apr_status_t)
 apr_memcache_version(apr_memcache_server_t *ms,
                   apr_pool_t *p,
                   char **baton)
 {
     apr_status_t rv;
-    apr_memcache_conn_t* conn;
-    apr_size_t written;
+    apr_memcache_conn_t *conn;
     struct iovec vec[2];
 
     rv = ms_find_conn(ms, &conn);
@@ -905,27 +1141,20 @@ apr_memcache_version(apr_memcache_server_t *ms,
     }
 
     /* version\r\n */
-    vec[0].iov_base = MC_VERSION;
+    vec[0].iov_base = (char*) MC_VERSION;
     vec[0].iov_len  = MC_VERSION_LEN;
 
-    vec[1].iov_base = MC_EOL;
+    vec[1].iov_base = (char*) MC_EOL;
     vec[1].iov_len  = MC_EOL_LEN;
 
-    rv = apr_socket_sendv(conn->sock, vec, 2, &written);
-
+    rv = sendv_and_get_server_line_with_timeout(ms, conn, vec, 2,
+                                                LOCK_NOT_HELD);
     if (rv != APR_SUCCESS) {
-        ms_bad_conn(ms, conn);
-        return rv;
-    }
-
-    rv = get_server_line(conn);
-    if (rv != APR_SUCCESS) {
-        ms_bad_conn(ms, conn);
         return rv;
     }
 
     if (strncmp(MS_VERSION, conn->buffer, MS_VERSION_LEN) == 0) {
-        *baton = apr_pstrmemdup(p, conn->buffer+MS_VERSION_LEN+1, 
+        *baton = apr_pstrmemdup(p, conn->buffer+MS_VERSION_LEN+1,
                                 conn->blen - MS_VERSION_LEN - 2);
         rv = APR_SUCCESS;
     }
@@ -937,6 +1166,388 @@ apr_memcache_version(apr_memcache_server_t *ms,
 
     return rv;
 }
+
+static apr_status_t mc_version_ping_lock_held(apr_memcache_server_t *ms)
+{
+    apr_status_t rv;
+    struct iovec vec[2];
+    apr_memcache_conn_t *conn;
+
+    rv = ms_find_conn(ms, &conn);
+
+    if (rv != APR_SUCCESS) {
+        return rv;
+    }
+
+    /* version\r\n */
+    vec[0].iov_base = (char*) MC_VERSION;
+    vec[0].iov_len  = MC_VERSION_LEN;
+
+    vec[1].iov_base = (char*) MC_EOL;
+    vec[1].iov_len  = MC_EOL_LEN;
+
+    rv = sendv_and_get_server_line_with_timeout(ms, conn, vec, 2, LOCK_HELD);
+    if (rv != APR_SUCCESS) {
+        return rv;
+    }
+
+    ms_release_conn(ms, conn);
+    return rv;
+}
+
+
+APU_DECLARE(void)
+apr_memcache_add_multget_key(apr_pool_t *data_pool,
+                             const char* key,
+                             apr_hash_t **values)
+{
+    apr_memcache_value_t* value;
+    apr_size_t klen = strlen(key);
+
+    /* create the value hash if need be */
+    if (!*values) {
+        *values = apr_hash_make(data_pool);
+    }
+
+    /* init key and add it to the value hash */
+    value = apr_pcalloc(data_pool, sizeof(apr_memcache_value_t));
+
+    value->status = APR_NOTFOUND;
+    value->key = apr_pstrdup(data_pool, key);
+
+    apr_hash_set(*values, value->key, klen, value);
+}
+
+static void mget_conn_result(int serverup,
+                             int connup,
+                             apr_status_t rv,
+                             apr_memcache_t *mc,
+                             apr_memcache_server_t *ms,
+                             apr_memcache_conn_t *conn,
+                             struct cache_server_query_t *server_query,
+                             apr_hash_t *values,
+                             apr_hash_t *server_queries)
+{
+    apr_int32_t j;
+    apr_memcache_value_t* value;
+
+    apr_hash_set(server_queries, &ms, sizeof(ms), NULL);
+
+    if (connup) {
+        ms_release_conn(ms, conn);
+    } else {
+        ms_bad_conn(ms, conn);
+
+        if (!serverup) {
+            apr_memcache_disable_server(mc, ms);
+        }
+    }
+
+    for (j = 1; j < server_query->query_vec_count ; j+=2) {
+        if (server_query->query_vec[j].iov_base) {
+            value = apr_hash_get(values, server_query->query_vec[j].iov_base,
+                                 strlen(server_query->query_vec[j].iov_base));
+
+            if (value->status == APR_NOTFOUND) {
+                value->status = rv;
+            }
+        }
+    }
+}
+
+APU_DECLARE(apr_status_t)
+apr_memcache_multgetp(apr_memcache_t *mc,
+                      apr_pool_t *temp_pool,
+                      apr_pool_t *data_pool,
+                      apr_hash_t *values)
+{
+    apr_status_t rv;
+    apr_memcache_server_t* ms;
+    apr_memcache_conn_t* conn;
+    apr_uint32_t hash;
+    apr_size_t written;
+    apr_size_t klen;
+    apr_size_t server_count;
+
+    apr_memcache_value_t* value;
+    apr_hash_index_t* value_hash_index;
+
+    /* this is a little over aggresive, but beats multiple loops
+     * to figure out how long each vector needs to be per-server.
+     */
+    apr_int32_t veclen = 2 + 2 * apr_hash_count(values) - 1; /* get <key>[<space><key>...]\r\n */
+    apr_int32_t i, j;
+    apr_int32_t queries_sent;
+    apr_int32_t queries_recvd;
+
+    apr_hash_t * server_queries = apr_hash_make(temp_pool);
+    struct cache_server_query_t* server_query;
+    apr_hash_index_t * query_hash_index;
+
+    apr_pollset_t* pollset;
+    const apr_pollfd_t* activefds;
+    apr_pollfd_t* pollfds;
+
+
+    /* build all the queries */
+    value_hash_index = apr_hash_first(temp_pool, values);
+    while (value_hash_index) {
+        void *v;
+        apr_hash_this(value_hash_index, NULL, NULL, &v);
+        value = v;
+        value_hash_index = apr_hash_next(value_hash_index);
+        klen = strlen(value->key);
+
+        hash = apr_memcache_hash(mc, value->key, klen);
+        ms = apr_memcache_find_server_hash(mc, hash);
+        if (ms == NULL) {
+            continue;
+        }
+
+        server_query = apr_hash_get(server_queries, &ms, sizeof(ms));
+
+        if (!server_query) {
+            rv = ms_find_conn(ms, &conn);
+
+            if (rv != APR_SUCCESS) {
+                apr_memcache_disable_server(mc, ms);
+                value->status = rv;
+                continue;
+            }
+
+            server_query = apr_pcalloc(temp_pool,sizeof(struct cache_server_query_t));
+
+            apr_hash_set(server_queries, &ms, sizeof(ms), server_query);
+
+            server_query->ms = ms;
+            server_query->conn = conn;
+            server_query->query_vec = apr_pcalloc(temp_pool, sizeof(struct iovec)*veclen);
+
+            /* set up the first key */
+            server_query->query_vec[0].iov_base = (char*) MC_GET;
+            server_query->query_vec[0].iov_len  = MC_GET_LEN;
+
+            server_query->query_vec[1].iov_base = (void*)(value->key);
+            server_query->query_vec[1].iov_len  = klen;
+
+            server_query->query_vec[2].iov_base = (char*) MC_EOL;
+            server_query->query_vec[2].iov_len  = MC_EOL_LEN;
+
+            server_query->query_vec_count = 3;
+        }
+        else {
+            j = server_query->query_vec_count - 1;
+
+            server_query->query_vec[j].iov_base = (char*) MC_WS;
+            server_query->query_vec[j].iov_len  = MC_WS_LEN;
+            j++;
+
+            server_query->query_vec[j].iov_base = (void*)(value->key);
+            server_query->query_vec[j].iov_len  = klen;
+            j++;
+
+            server_query->query_vec[j].iov_base = (char*) MC_EOL;
+            server_query->query_vec[j].iov_len  = MC_EOL_LEN;
+            j++;
+
+           server_query->query_vec_count = j;
+        }
+    }
+
+    /* create polling structures */
+    server_count = apr_hash_count(server_queries);
+    if (server_count == 0) {
+        return APR_EGENERAL;
+    }
+    pollfds = apr_pcalloc(temp_pool, server_count * sizeof(apr_pollfd_t));
+
+    rv = apr_pollset_create(&pollset, server_count, temp_pool, 0);
+
+    if (rv != APR_SUCCESS) {
+        query_hash_index = apr_hash_first(temp_pool, server_queries);
+
+        while (query_hash_index) {
+            void *v;
+            apr_hash_this(query_hash_index, NULL, NULL, &v);
+            server_query = v;
+            query_hash_index = apr_hash_next(query_hash_index);
+
+            mget_conn_result(TRUE, TRUE, rv, mc, server_query->ms, server_query->conn,
+                             server_query, values, server_queries);
+        }
+
+        return rv;
+    }
+
+    /* send all the queries */
+    queries_sent = 0;
+    query_hash_index = apr_hash_first(temp_pool, server_queries);
+
+    while (query_hash_index) {
+        void *v;
+        apr_hash_this(query_hash_index, NULL, NULL, &v);
+        server_query = v;
+        query_hash_index = apr_hash_next(query_hash_index);
+
+        conn = server_query->conn;
+        ms = server_query->ms;
+
+        for (i = 0, rv = APR_SUCCESS; i < veclen && rv == APR_SUCCESS; i += APR_MAX_IOVEC_SIZE) {
+            rv = apr_socket_sendv(conn->sock, &(server_query->query_vec[i]),
+                                  veclen-i>APR_MAX_IOVEC_SIZE ? APR_MAX_IOVEC_SIZE : veclen-i , &written);
+        }
+
+        if (rv != APR_SUCCESS) {
+            mget_conn_result(FALSE, FALSE, rv, mc, ms, conn,
+                             server_query, values, server_queries);
+            continue;
+        }
+
+        pollfds[queries_sent].desc_type = APR_POLL_SOCKET;
+        pollfds[queries_sent].reqevents = APR_POLLIN;
+        pollfds[queries_sent].p = temp_pool;
+        pollfds[queries_sent].desc.s = conn->sock;
+        pollfds[queries_sent].client_data = (void *)server_query;
+        apr_pollset_add (pollset, &pollfds[queries_sent]);
+
+        queries_sent++;
+    }
+
+    while (queries_sent) {
+        rv = apr_pollset_poll(pollset, mc->timeout_microseconds, &queries_recvd,
+                              &activefds);
+
+        if (rv != APR_SUCCESS) {
+            /* timeout */
+            queries_sent = 0;
+            continue;
+        }
+        for (i = 0; i < queries_recvd; i++) {
+            server_query = activefds[i].client_data;
+            conn = server_query->conn;
+            ms = server_query->ms;
+
+           rv = get_server_line(conn);
+
+           if (rv != APR_SUCCESS) {
+               apr_pollset_remove (pollset, &activefds[i]);
+               mget_conn_result(FALSE, FALSE, rv, mc, ms, conn,
+                                server_query, values, server_queries);
+               queries_sent--;
+               continue;
+           }
+
+           if (strncmp(MS_VALUE, conn->buffer, MS_VALUE_LEN) == 0) {
+               char *key;
+               char *flags;
+               char *length;
+               char *last;
+               char *data;
+               apr_size_t len = 0;
+               int length_ok = 1;
+
+               key = apr_strtok(conn->buffer, " ", &last); /* just the VALUE, ignore */
+               key = apr_strtok(NULL, " ", &last);
+               flags = apr_strtok(NULL, " ", &last);
+
+
+               length = apr_strtok(NULL, " ", &last);
+               length_ok = (length == NULL) || parse_size(length, &len);
+               value = apr_hash_get(values, key, strlen(key));
+
+               if (value) {
+                   if (length_ok) {
+                       apr_bucket_brigade *bbb;
+                       apr_bucket *e;
+
+                       /* eat the trailing \r\n */
+                       rv = apr_brigade_partition(conn->bb, len+2, &e);
+
+                       if (rv != APR_SUCCESS) {
+                           apr_pollset_remove (pollset, &activefds[i]);
+                           mget_conn_result(FALSE, FALSE, rv, mc, ms, conn,
+                                            server_query, values, server_queries);
+                           queries_sent--;
+                           continue;
+                       }
+
+                       bbb = apr_brigade_split(conn->bb, e);
+
+                       rv = apr_brigade_pflatten(conn->bb, &data, &len, data_pool);
+
+                       if (rv != APR_SUCCESS) {
+                           apr_pollset_remove (pollset, &activefds[i]);
+                           mget_conn_result(FALSE, FALSE, rv, mc, ms, conn,
+                                            server_query, values, server_queries);
+                           queries_sent--;
+                           continue;
+                       }
+
+                       rv = apr_brigade_destroy(conn->bb);
+                       if (rv != APR_SUCCESS) {
+                           apr_pollset_remove (pollset, &activefds[i]);
+                           mget_conn_result(FALSE, FALSE, rv, mc, ms, conn,
+                                            server_query, values, server_queries);
+                           queries_sent--;
+                           continue;
+                       }
+
+                       conn->bb = bbb;
+
+                       value->len = len - 2;
+                       data[value->len] = '\0';
+                       value->data = data;
+                   }
+
+                   value->status = rv;
+                   value->flags = atoi(flags);
+
+                   /* stay on the server */
+                   i--;
+
+               }
+               else {
+                   /* TODO: Server Sent back a key I didn't ask for or my
+                    *       hash is corrupt */
+               }
+           }
+           else if (strncmp(MS_END, conn->buffer, MS_END_LEN) == 0) {
+               /* this connection is done */
+               apr_pollset_remove (pollset, &activefds[i]);
+               ms_release_conn(ms, conn);
+               apr_hash_set(server_queries, &ms, sizeof(ms), NULL);
+
+               queries_sent--;
+           }
+           else {
+               /* unknown reply? */
+               rv = APR_EGENERAL;
+           }
+
+        } /* /for */
+    } /* /while */
+
+    query_hash_index = apr_hash_first(temp_pool, server_queries);
+    while (query_hash_index) {
+        void *v;
+        apr_hash_this(query_hash_index, NULL, NULL, &v);
+        server_query = v;
+        query_hash_index = apr_hash_next(query_hash_index);
+
+        conn = server_query->conn;
+        ms = server_query->ms;
+
+        mget_conn_result(TRUE, (rv == APR_SUCCESS), rv, mc, ms, conn,
+                         server_query, values, server_queries);
+        continue;
+    }
+
+    apr_pollset_destroy(pollset);
+    apr_pool_clear(temp_pool);
+    return APR_SUCCESS;
+
+}
+
 
 
 /**
@@ -954,6 +1565,9 @@ apr_memcache_version(apr_memcache_server_t *ms,
 
 #define STAT_version MS_STAT " version "
 #define STAT_version_LEN (sizeof(STAT_version)-1)
+
+#define STAT_pointer_size MS_STAT " pointer_size "
+#define STAT_pointer_size_LEN (sizeof(STAT_pointer_size)-1)
 
 #define STAT_rusage_user MS_STAT " rusage_user "
 #define STAT_rusage_user_LEN (sizeof(STAT_rusage_user)-1)
@@ -991,6 +1605,9 @@ apr_memcache_version(apr_memcache_server_t *ms,
 #define STAT_get_misses MS_STAT " get_misses "
 #define STAT_get_misses_LEN (sizeof(STAT_get_misses)-1)
 
+#define STAT_evictions MS_STAT " evictions "
+#define STAT_evictions_LEN (sizeof(STAT_evictions)-1)
+
 #define STAT_bytes_read MS_STAT " bytes_read "
 #define STAT_bytes_read_LEN (sizeof(STAT_bytes_read)-1)
 
@@ -1000,45 +1617,54 @@ apr_memcache_version(apr_memcache_server_t *ms,
 #define STAT_limit_maxbytes MS_STAT " limit_maxbytes "
 #define STAT_limit_maxbytes_LEN (sizeof(STAT_limit_maxbytes)-1)
 
+#define STAT_threads MS_STAT " threads "
+#define STAT_threads_LEN (sizeof(STAT_threads)-1)
 
-static const char* stat_read_string(apr_pool_t *p, char* buf, int len)
+static const char *stat_read_string(apr_pool_t *p, char *buf, apr_size_t len)
 {
     /* remove trailing \r\n and null char */
     return apr_pstrmemdup(p, buf, len-2);
 }
 
-static apr_uint32_t stat_read_uint32(apr_pool_t *p, char* buf, int len)
+static apr_uint32_t stat_read_uint32(apr_pool_t *p, char *buf, apr_size_t  len)
 {
     buf[len-2] = '\0';
     return atoi(buf);
 }
 
-static apr_uint64_t stat_read_uint64(apr_pool_t *p, char* buf, int len)
+static apr_uint64_t stat_read_uint64(apr_pool_t *p, char *buf, apr_size_t  len)
 {
     buf[len-2] = '\0';
     return apr_atoi64(buf);
 }
 
-static apr_time_t stat_read_time(apr_pool_t *p, char* buf, int len)
+static apr_time_t stat_read_time(apr_pool_t *p, char *buf, apr_size_t  len)
 {
     buf[len-2] = '\0';
     return apr_time_from_sec(atoi(buf));
 }
 
-static apr_time_t stat_read_rtime(apr_pool_t *p, char* buf, int len)
+static apr_time_t stat_read_rtime(apr_pool_t *p, char *buf, apr_size_t  len)
 {
-    char* tok;
-    char* secs;
-    char* usecs;
+    char *tok;
+    char *secs;
+    char *usecs;
+    const char *sep = ":.";
 
     buf[len-2] = '\0';
-    secs = apr_strtok(buf,":", &tok);
-    usecs = apr_strtok(NULL,":", &tok);
-    return apr_time_make(atoi(secs), atoi(usecs));
+
+    secs = apr_strtok(buf, sep, &tok);
+    usecs = apr_strtok(NULL, sep, &tok);
+    if (secs && usecs) {
+        return apr_time_make(atoi(secs), atoi(usecs));
+    }
+    else {
+        return apr_time_make(0, 0);
+    }
 }
 
 /**
- * I got tired of Typing. Meh. 
+ * I got tired of Typing. Meh.
  *
  * TODO: Convert it to static tables to make it cooler.
  */
@@ -1070,15 +1696,16 @@ static apr_time_t stat_read_rtime(apr_pool_t *p, char* buf, int len)
 #define mc_do_stat(name, type) \
     if (mc_stat_cmp(name)) { \
         stats-> name = mc_stat_ ## type ((STAT_ ## name ## _LEN)); \
-    } 
+    }
 
-static void update_stats(apr_pool_t *p, apr_memcache_conn_t* conn, 
+static void update_stats(apr_pool_t *p, apr_memcache_conn_t *conn,
                          apr_memcache_stats_t *stats)
 {
 
     mc_do_stat(version, str)
     else mc_do_stat(pid, uint32)
     else mc_do_stat(uptime, uint32)
+    else mc_do_stat(pointer_size, uint32)
     else mc_do_stat(time, time)
     else mc_do_stat(rusage_user, rtime)
     else mc_do_stat(rusage_system, rtime)
@@ -1092,19 +1719,21 @@ static void update_stats(apr_pool_t *p, apr_memcache_conn_t* conn,
     else mc_do_stat(cmd_set, uint32)
     else mc_do_stat(get_hits, uint32)
     else mc_do_stat(get_misses, uint32)
+    else mc_do_stat(evictions, uint64)
     else mc_do_stat(bytes_read, uint64)
     else mc_do_stat(bytes_written, uint64)
     else mc_do_stat(limit_maxbytes, uint32)
+    else mc_do_stat(threads, uint32)
 }
 
-APR_DECLARE(apr_status_t)
+APU_DECLARE(apr_status_t)
 apr_memcache_stats(apr_memcache_server_t *ms,
                   apr_pool_t *p,
-                  apr_memcache_stats_t **stats) 
+                  apr_memcache_stats_t **stats)
 {
     apr_memcache_stats_t *ret;
     apr_status_t rv;
-    apr_memcache_conn_t* conn;
+    apr_memcache_conn_t *conn;
     apr_size_t written;
     struct iovec vec[2];
 
@@ -1115,10 +1744,10 @@ apr_memcache_stats(apr_memcache_server_t *ms,
     }
 
     /* version\r\n */
-    vec[0].iov_base = MC_STATS;
+    vec[0].iov_base = (char*) MC_STATS;
     vec[0].iov_len  = MC_STATS_LEN;
 
-    vec[1].iov_base = MC_EOL;
+    vec[1].iov_base = (char*) MC_EOL;
     vec[1].iov_len  = MC_EOL_LEN;
 
     rv = apr_socket_sendv(conn->sock, vec, 2, &written);
@@ -1128,7 +1757,12 @@ apr_memcache_stats(apr_memcache_server_t *ms,
         return rv;
     }
 
-    ret = apr_pcalloc(p, sizeof(apr_memcache_stats_t *));
+    rv = poll_server_releasing_connection_on_failure(ms, LOCK_NOT_HELD, conn);
+    if (rv != APR_SUCCESS) {
+        return rv;
+    }
+
+    ret = apr_pcalloc(p, sizeof(apr_memcache_stats_t));
 
     do {
         rv = get_server_line(conn);
@@ -1154,9 +1788,15 @@ apr_memcache_stats(apr_memcache_server_t *ms,
 
     ms_release_conn(ms, conn);
 
-    if(stats)
+    if (stats) {
         *stats = ret;
+    }
 
     return rv;
 }
 
+void apr_memcache_set_timeout_microseconds(
+    apr_memcache_t *mc,
+    apr_int32_t timeout_microseconds) {
+    mc->timeout_microseconds = timeout_microseconds;
+}
