@@ -248,6 +248,7 @@ static int ip_count_check_auth(request_rec *r)
     char* whitelisted_netmask;
     apr_ipsubnet_t* this_subnet;
     char *last;
+    int pattern_matched = 0;
     
     if (r->main) {
         return DECLINED;
@@ -281,21 +282,25 @@ static int ip_count_check_auth(request_rec *r)
         det->posn = 0;
         det->lastseenposn = 0;
         new = 1;
-    }
-    else {
+    } else {
         det = (user_details*)result;
     }
 
-
     /*for the configured uris... */
     req_uris = apr_pstrdup(r->pool, conf->used_uris);
+
     uri_samples = apr_strtok(req_uris, " ",&last);
     do {
-	if (!strstr(r->uri,uri_samples)) {
-	return DECLINED;
-	}
+        if (strstr(r->uri, uri_samples)) {
+            pattern_matched = 1;
+            break;
+        }
     uri_samples = apr_strtok(NULL, " ",&last);
     } while (uri_samples);
+
+    if (!pattern_matched) {
+        return DECLINED;
+    }
 
     /*Process the whitelist, skip the requests mathcing the set criteria*/    
     all_whitelisted_ip = apr_pstrdup(r->pool, conf->whitelisted_ip);
